@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-
 def _json_default(obj: Any) -> Any:
     """Fallback serialiser for types that json.dumps cannot handle natively."""
     if isinstance(obj, (bytes, bytearray)):
@@ -13,6 +12,24 @@ def _json_default(obj: Any) -> Any:
     if hasattr(obj, "isoformat"):
         return obj.isoformat()
     return str(obj)
+
+
+try:
+    import orjson
+
+    _ORJSON_OPTS = orjson.OPT_SERIALIZE_NUMPY
+    _ORJSON_AVAILABLE = True
+except ImportError:
+    _ORJSON_AVAILABLE = False
+
+
+def _dumps(value: Any) -> str:
+    if _ORJSON_AVAILABLE:
+        try:
+            return orjson.dumps(value, default=_json_default, option=_ORJSON_OPTS).decode("ascii")
+        except TypeError:
+            pass
+    return json.dumps(value, default=_json_default)
 
 
 def flatten_dict(
@@ -47,9 +64,9 @@ def flatten_dict(
                     )
                 )
             else:
-                items[new_key] = json.dumps(value, default=_json_default)
+                items[new_key] = _dumps(value)
         elif isinstance(value, (list, tuple)):
-            items[new_key] = json.dumps(value, default=_json_default)
+            items[new_key] = _dumps(value)
         else:
             items[new_key] = value
     return items
