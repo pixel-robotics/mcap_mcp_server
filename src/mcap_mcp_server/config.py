@@ -33,6 +33,10 @@ class ServerConfig:
     transport: str = "stdio"
     sse_port: int = 8080
     flatten_depth: int = 3
+    foxglove_api_key: str = ""
+    foxglove_api_url: str = "https://api.foxglove.dev"
+    foxglove_download_dir: Path | None = None
+    foxglove_import_timeout_s: int = 900
 
     def __post_init__(self) -> None:
         if self.max_memory_mb < 64:
@@ -40,6 +44,13 @@ class ServerConfig:
                 f"MCAP_MAX_MEMORY_MB={self.max_memory_mb} is too low. "
                 "At least 64 MB is required to load and query recordings."
             )
+
+    @property
+    def foxglove_dir(self) -> Path:
+        """Directory that imported Foxglove recordings are written to."""
+        if self.foxglove_download_dir is not None:
+            return self.foxglove_download_dir
+        return self.data_dir / "foxglove"
 
     def configure_logging(self) -> None:
         logging.basicConfig(
@@ -60,6 +71,10 @@ def _load_toml(path: Path) -> dict:
         return {}
 
 
+def _optional_path(value: str | None) -> Path | None:
+    return Path(value) if value else None
+
+
 def _bool_env(value: str) -> bool:
     return value.lower() in ("1", "true", "yes")
 
@@ -78,6 +93,7 @@ def load_config(
     limits_section = toml_data.get("limits", {})
     decoder_section = toml_data.get("decoder", {})
     logging_section = toml_data.get("logging", {})
+    foxglove_section = toml_data.get("foxglove", {})
 
     cfg = ServerConfig(
         data_dir=Path(server_section.get("data_dir", ".")),
@@ -89,6 +105,10 @@ def load_config(
         max_row_limit=limits_section.get("max_row_limit", 10000),
         flatten_depth=decoder_section.get("flatten_depth", 3),
         log_level=logging_section.get("level", "INFO"),
+        foxglove_api_key=foxglove_section.get("api_key", ""),
+        foxglove_api_url=foxglove_section.get("api_url", "https://api.foxglove.dev"),
+        foxglove_download_dir=_optional_path(foxglove_section.get("download_dir")),
+        foxglove_import_timeout_s=foxglove_section.get("import_timeout_s", 900),
     )
 
     env_map = {
@@ -102,6 +122,11 @@ def load_config(
         "MCAP_TRANSPORT": ("transport", str),
         "MCAP_SSE_PORT": ("sse_port", int),
         "MCAP_FLATTEN_DEPTH": ("flatten_depth", int),
+        "MCAP_FOXGLOVE_API_KEY": ("foxglove_api_key", str),
+        "FOXGLOVE_API_KEY": ("foxglove_api_key", str),
+        "MCAP_FOXGLOVE_API_URL": ("foxglove_api_url", str),
+        "MCAP_FOXGLOVE_DOWNLOAD_DIR": ("foxglove_download_dir", Path),
+        "MCAP_FOXGLOVE_IMPORT_TIMEOUT_S": ("foxglove_import_timeout_s", int),
     }
     for env_key, (attr, converter) in env_map.items():
         val = os.environ.get(env_key)

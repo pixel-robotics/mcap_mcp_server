@@ -12,11 +12,17 @@ graph TD
     Decoders["decoders/<br/>JSON · Protobuf · ROS1 · ROS2 · FlatBuffer"]
     Engine["query_engine.py<br/>DuckDB wrapper"]
     Files["MCAP files on disk"]
+    Foxglove["foxglove.py<br/>Data Platform client"]
+    Cloud["Foxglove API<br/>+ robots / edge sites"]
 
     Client -->|"list_recordings<br/>get_recording_info<br/>get_schema<br/>get_version"| Server
     Client -->|load_recording| Server
     Client -->|query| Server
+    Client -->|"list_foxglove_recordings<br/>import_foxglove_recording"| Server
 
+    Server --> Foxglove
+    Foxglove -->|"list · import from device · download"| Cloud
+    Foxglove -->|"writes .mcap"| Files
     Server --> Index
     Server --> Reader
     Server --> Registry
@@ -32,8 +38,9 @@ graph TD
 
 | Module | Role |
 |--------|------|
-| `server.py` | MCP tool registration (6 tools), request orchestration |
+| `server.py` | MCP tool registration (8 tools), request orchestration |
 | `config.py` | Config loading: defaults → TOML → env vars → CLI. Validates `max_memory_mb >= 64` |
+| `foxglove.py` | Foxglove Data Platform REST client: find recordings, trigger an upload from the device, download MCAP |
 | `recording_index.py` | Scans directories for `.mcap` files, caches summaries, filters by date |
 | `mcap_reader.py` | Reads MCAP summary and iterates messages using indexed reader |
 | `decoder_registry.py` | Discovers and dispatches to the correct `MessageDecoder` by encoding |
@@ -53,6 +60,16 @@ graph TD
 7. `query_engine` registers each DataFrame as a named DuckDB table
 8. If memory exceeds the configured budget, LRU eviction removes the oldest tables and reports them back to the caller
 9. Subsequent `query` calls execute SQL against these tables
+
+## Import path
+
+1. `import_foxglove_recording` first checks the data directory and the Foxglove download directory — an existing local file short-circuits the whole path
+2. The identifier is resolved against `GET /v1/recordings/{keyOrId}`, falling back to a filtered `GET /v1/recordings` listing matched on file name or key; more than one match is reported back instead of guessed
+3. If `importStatus` is not `complete`, the recording is still on the robot or edge site: `POST /v1/recordings/{id}/import` asks Foxglove to pull it in, and the recording is then polled until it becomes `complete`
+4. `POST /v1/data/download` (falling back to the older `/v1/data/stream`) returns either the MCAP bytes or a short-lived signed link, which is streamed to a `.part` file and renamed on success. A topic or time filter yields a partial recording, which is stored under a filter-specific name so it cannot be mistaken for the full file
+5. The recording index is invalidated so the new file appears in `list_recordings`, and the path is handed back for `load_recording`
+
+Only the standard library is used for HTTP, so the Foxglove tools add no dependencies.
 
 ## Memory management
 

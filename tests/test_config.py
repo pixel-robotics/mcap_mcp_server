@@ -156,3 +156,50 @@ class TestLoadConfig:
     def test_default_toml_path_when_none(self):
         cfg = load_config(toml_path=None)
         assert isinstance(cfg, ServerConfig)
+
+
+class TestFoxgloveConfig:
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv("FOXGLOVE_API_KEY", raising=False)
+        cfg = ServerConfig()
+        assert cfg.foxglove_api_key == ""
+        assert cfg.foxglove_api_url == "https://api.foxglove.dev"
+        assert cfg.foxglove_import_timeout_s == 900
+
+    def test_download_dir_defaults_below_data_dir(self):
+        cfg = ServerConfig(data_dir=Path("/data"))
+        assert cfg.foxglove_dir == Path("/data/foxglove")
+
+    def test_download_dir_override(self):
+        cfg = ServerConfig(data_dir=Path("/data"), foxglove_download_dir=Path("/mnt/bags"))
+        assert cfg.foxglove_dir == Path("/mnt/bags")
+
+    def test_from_toml(self, tmp_path: Path):
+        toml_file = tmp_path / "cfg.toml"
+        toml_file.write_text(
+            textwrap.dedent(
+                """
+                [foxglove]
+                api_key = "fox_sk_toml"
+                api_url = "https://api.example.com"
+                download_dir = "/mnt/bags"
+                import_timeout_s = 120
+                """
+            )
+        )
+        cfg = load_config(toml_path=toml_file)
+        assert cfg.foxglove_api_key == "fox_sk_toml"
+        assert cfg.foxglove_api_url == "https://api.example.com"
+        assert cfg.foxglove_dir == Path("/mnt/bags")
+        assert cfg.foxglove_import_timeout_s == 120
+
+    def test_env_overrides_toml(self, tmp_path: Path, monkeypatch):
+        toml_file = tmp_path / "cfg.toml"
+        toml_file.write_text('[foxglove]\napi_key = "from_toml"\n')
+        monkeypatch.setenv("FOXGLOVE_API_KEY", "from_env")
+        monkeypatch.setenv("MCAP_FOXGLOVE_DOWNLOAD_DIR", "/env/bags")
+        monkeypatch.setenv("MCAP_FOXGLOVE_IMPORT_TIMEOUT_S", "60")
+        cfg = load_config(toml_path=toml_file)
+        assert cfg.foxglove_api_key == "from_env"
+        assert cfg.foxglove_dir == Path("/env/bags")
+        assert cfg.foxglove_import_timeout_s == 60

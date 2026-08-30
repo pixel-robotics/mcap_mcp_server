@@ -16,6 +16,10 @@ Configuration is layered: **defaults → TOML file → environment variables →
 | `MCAP_TRANSPORT` | `stdio` | Transport: `stdio` or `sse` |
 | `MCAP_SSE_PORT` | `8080` | Port for SSE transport |
 | `MCAP_FLATTEN_DEPTH` | `3` | Max nesting depth for message flattening |
+| `FOXGLOVE_API_KEY` | — | Foxglove Data Platform API key (also accepted as `MCAP_FOXGLOVE_API_KEY`) |
+| `MCAP_FOXGLOVE_API_URL` | `https://api.foxglove.dev` | Foxglove API base URL |
+| `MCAP_FOXGLOVE_DOWNLOAD_DIR` | `<data_dir>/foxglove` | Where imported recordings are written |
+| `MCAP_FOXGLOVE_IMPORT_TIMEOUT_S` | `900` | How long to wait for a device to upload a recording |
 
 ## TOML config file
 
@@ -38,7 +42,35 @@ flatten_depth = 3
 
 [logging]
 level = "INFO"
+
+[foxglove]
+api_key = "fox_sk_..."
+api_url = "https://api.foxglove.dev"
+download_dir = "/data/recordings/foxglove"
+import_timeout_s = 900
 ```
+
+## Foxglove import
+
+`list_foxglove_recordings` and `import_foxglove_recording` need an API key created under
+**Settings → API keys** in Foxglove. The key needs read access to recordings and permission to
+import them. Prefer the environment variable over the TOML file so the key stays out of version
+control:
+
+```json
+{
+  "mcpServers": {
+    "mcap-query": {
+      "command": "uvx",
+      "args": ["mcap-mcp-server[all]"],
+      "env": { "FOXGLOVE_API_KEY": "fox_sk_..." }
+    }
+  }
+}
+```
+
+Without a key the two Foxglove tools return an `error` explaining what to set; every other tool
+keeps working on local files.
 
 ## MCP client integration
 

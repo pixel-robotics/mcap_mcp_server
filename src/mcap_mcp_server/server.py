@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -15,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from mcap_mcp_server import __version__
 from mcap_mcp_server.config import ServerConfig
 from mcap_mcp_server.decoder_registry import DecoderRegistry
+from mcap_mcp_server.foxglove import FoxgloveClient, FoxgloveError, FoxgloveRecording
 from mcap_mcp_server.mcap_reader import (
     get_schema_info,
     get_summary,
@@ -35,7 +37,9 @@ def create_server(config: ServerConfig) -> FastMCP:
             "Use list_recordings to discover files, get_schema to inspect available "
             "tables and columns, load_recording to load data into DuckDB, and query "
             "to run SQL. All tables have a timestamp_us (BIGINT, microseconds) column "
-            "for time-based JOINs across topics."
+            "for time-based JOINs across topics. Recordings that are not on this "
+            "machine yet can be fetched from Foxglove with import_foxglove_recording, "
+            "which also triggers the upload from the robot when needed."
         ),
     )
 
@@ -43,6 +47,11 @@ def create_server(config: ServerConfig) -> FastMCP:
     registry.discover()
 
     index = RecordingIndex(recursive=config.recursive)
+
+    foxglove = FoxgloveClient(
+        api_key=config.foxglove_api_key or None,
+        api_url=config.foxglove_api_url,
+    )
 
     engine = QueryEngine(
         query_timeout_s=config.query_timeout_s,
@@ -343,6 +352,186 @@ def create_server(config: ServerConfig) -> FastMCP:
         return json.dumps(result, default=_json_default, indent=2)
 
     @mcp.tool(
+        name="list_foxglove_recordings",
+        description=(
+            "List recordings available in Foxglove, including ones still sitting "
+            "on a robot or edge site that have not been uploaded yet. Each entry "
+            "reports an import_status ('complete' means downloadable now; 'none', "
+            "'pending' or 'importing' means it still has to be uploaded from the "
+            "device) and whether a local copy already exists. "
+            "Use this to discover recordings that list_recordings cannot see "
+            "because they are not on this machine. Requires a Foxglove API key."
+        ),
+    )
+    def list_foxglove_recordings(
+        device: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        import_status: str | None = None,
+        limit: int = 50,
+    ) -> str:
+        """List remote Foxglove recordings and whether they are local already."""
+        try:
+            recordings = foxglove.list_recordings(
+                device=device,
+                start=start,
+                end=end,
+                import_status=import_status,
+                limit=limit,
+            )
+            entries = []
+            for rec in recordings:
+                entry = rec.to_json()
+                local = _find_local_recording(rec.filename, config)
+                entry["local_path"] = str(local) if local else None
+                entry["needs_device_upload"] = not rec.is_imported
+                entries.append(entry)
+        except FoxgloveError as e:
+            return json.dumps({"error": str(e)}, indent=2)
+
+        return json.dumps(
+            {
+                "count": len(entries),
+                "recordings": entries,
+                "hint": (
+                    "Call import_foxglove_recording with the recording id, key or "
+                    "file name to download it. Recordings with "
+                    "needs_device_upload=true are uploaded from the device first, "
+                    "which can take several minutes."
+                ),
+            },
+            indent=2,
+        )
+
+    @mcp.tool(
+        name="import_foxglove_recording",
+        description=(
+            "Make a Foxglove recording available locally as an MCAP file, then "
+            "return its path so it can be loaded with load_recording. "
+            "If the file is already on this machine it is returned immediately. "
+            "Otherwise it is downloaded from Foxglove — and if the recording is "
+            "still on the robot or edge site (import_status other than 'complete') "
+            "the upload from the device is triggered automatically and waited for. "
+            "Identify the recording by id, key, or file name; alternatively give a "
+            "device plus a start/end time window. Requires a Foxglove API key."
+        ),
+    )
+    def import_foxglove_recording(
+        recording: str | None = None,
+        device: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        topics: list[str] | None = None,
+        force: bool = False,
+        wait: bool = True,
+        timeout_s: int | None = None,
+    ) -> str:
+        """Download a Foxglove recording, uploading it from the device if needed."""
+        if not recording and not device:
+            return json.dumps(
+                {
+                    "error": (
+                        "Specify 'recording' (id, key or file name) or 'device' "
+                        "together with a start/end time window."
+                    )
+                },
+                indent=2,
+            )
+
+        # A topic or time filter produces a partial file, so it gets its own
+        # name and never satisfies (or is satisfied by) a full-recording import.
+        filtered = bool(topics or start or end)
+
+        # 1. Already on disk? Nothing to import.
+        if recording and not force and not filtered:
+            local = _find_local_recording(recording, config)
+            if local is not None:
+                return json.dumps(
+                    {
+                        "status": "already_local",
+                        "path": str(local),
+                        "size_mb": round(local.stat().st_size / (1024 * 1024), 1),
+                        "hint": "Call load_recording with this path to query it.",
+                    },
+                    indent=2,
+                )
+
+        try:
+            # 2. Resolve which remote recording is meant.
+            match = _resolve_foxglove_recording(
+                foxglove, recording, device, start, end
+            )
+            if isinstance(match, dict):
+                return json.dumps(match, indent=2)
+
+            # 3. Still on the device? Ask Foxglove to pull it in.
+            import_triggered = False
+            import_wait_s = 0.0
+            if not match.is_imported:
+                import_status = foxglove.request_import(match.id or match.key)
+                import_triggered = True
+                logger.info(
+                    "Requested Foxglove import of %s (status: %s)",
+                    match.id,
+                    import_status,
+                )
+                if not wait:
+                    return json.dumps(
+                        {
+                            "status": "import_started",
+                            "recording": match.to_json(),
+                            "import_status": import_status,
+                            "hint": (
+                                "The device is uploading the recording. Call this "
+                                "tool again in a few minutes to download it."
+                            ),
+                        },
+                        indent=2,
+                    )
+                wait_start = time.monotonic()
+                match = foxglove.wait_for_import(
+                    match.id or match.key,
+                    timeout_s=timeout_s or config.foxglove_import_timeout_s,
+                )
+                import_wait_s = time.monotonic() - wait_start
+
+            # 4. Download the MCAP bytes.
+            dest = config.foxglove_dir / _import_filename(match, topics, start, end)
+            if dest.exists() and not force:
+                downloaded_bytes = dest.stat().st_size
+                status = "already_local"
+            else:
+                download_start = time.monotonic()
+                downloaded_bytes = foxglove.download_recording(
+                    match, dest, topics=topics, start=start, end=end
+                )
+                logger.info(
+                    "Downloaded %s (%.1f MB) in %.1fs",
+                    dest,
+                    downloaded_bytes / (1024 * 1024),
+                    time.monotonic() - download_start,
+                )
+                status = "imported"
+        except FoxgloveError as e:
+            return json.dumps({"error": str(e)}, indent=2)
+
+        index.invalidate()
+
+        return json.dumps(
+            {
+                "status": status,
+                "path": str(dest),
+                "file": dest.name,
+                "size_mb": round(downloaded_bytes / (1024 * 1024), 1),
+                "recording": match.to_json(),
+                "uploaded_from_device": import_triggered,
+                "device_upload_wait_s": round(import_wait_s, 1),
+                "hint": "Call load_recording with this path to query it.",
+            },
+            indent=2,
+        )
+
+    @mcp.tool(
         name="get_version",
         description=(
             "Return the server version, supported encodings, and upgrade command. "
@@ -379,6 +568,100 @@ def _resolve_file(file: str, data_dir: Path) -> Path:
         if match.is_file():
             return match
     raise FileNotFoundError(f"MCAP file not found: {file} (searched in {data_dir})")
+
+
+def _find_local_recording(name: str, config: ServerConfig) -> Path | None:
+    """Return an existing local MCAP file for a recording name, or None.
+
+    Looks in the data directory and in the Foxglove download directory, both
+    non-recursively and recursively, so a recording imported earlier is not
+    downloaded a second time.
+    """
+    filename = Path(name).name
+    if not filename:
+        return None
+    if not filename.endswith(".mcap"):
+        filename = f"{filename}.mcap"
+
+    direct = Path(name)
+    if direct.is_absolute() and direct.is_file():
+        return direct
+
+    for root in (config.foxglove_dir, config.data_dir):
+        candidate = root / filename
+        if candidate.is_file():
+            return candidate
+
+    try:
+        for match in config.data_dir.rglob(filename):
+            if match.is_file():
+                return match
+    except OSError:
+        logger.debug("Could not scan %s for %s", config.data_dir, filename)
+    return None
+
+
+def _import_filename(
+    recording: FoxgloveRecording,
+    topics: list[str] | None,
+    start: str | None,
+    end: str | None,
+) -> str:
+    """Local file name for an imported recording.
+
+    A topic or time filter yields only part of the recording, so it gets a
+    name of its own — otherwise a later full import would be silently served
+    from the truncated file.
+    """
+    name = recording.filename
+    if not (topics or start or end):
+        return name
+
+    fingerprint = json.dumps(
+        {"topics": sorted(topics or []), "start": start, "end": end},
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(fingerprint.encode()).hexdigest()[:8]
+    return f"{name[: -len('.mcap')]}_part-{digest}.mcap"
+
+
+def _resolve_foxglove_recording(
+    client: FoxgloveClient,
+    recording: str | None,
+    device: str | None,
+    start: str | None,
+    end: str | None,
+) -> FoxgloveRecording | dict[str, Any]:
+    """Pick the single remote recording meant by the tool arguments.
+
+    Returns a JSON-ready dict instead of a recording when nothing matched or
+    the arguments are ambiguous — guessing between recordings would download
+    the wrong data.
+    """
+    if recording:
+        matches = client.find_recording(recording, device=device, start=start, end=end)
+        subject = f"recording {recording!r}"
+    else:
+        matches = client.list_recordings(device=device, start=start, end=end, limit=50)
+        subject = f"device {device!r} between {start!r} and {end!r}"
+
+    if not matches:
+        return {
+            "error": f"No Foxglove recording found for {subject}.",
+            "hint": (
+                "Use list_foxglove_recordings to see what is available, and check "
+                "the device name and time window."
+            ),
+        }
+
+    if len(matches) > 1:
+        return {
+            "error": f"{len(matches)} Foxglove recordings match {subject}.",
+            "candidates": [rec.to_json() for rec in matches[:20]],
+            "hint": "Call again with 'recording' set to one of the ids above.",
+        }
+
+    return matches[0]
 
 
 def _normalize_iso(value: str) -> str:

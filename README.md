@@ -29,6 +29,7 @@ Just talk to your LLM:
 - *"In session_017.mcap find all moments where voltage dropped below 22V"*
 - *"Correlate IMU acceleration with motor current."*
 - *"Compare average battery voltage across my last 5 runs"*
+- *"Import today's recording from pixel-bot-1 — it's still on the robot"*
 - *"What version of mcap-mcp-server am I running? Update it"*
 
 
@@ -41,9 +42,30 @@ Just talk to your LLM:
 | `get_schema` | no | SQL table names & column types — for query planning |
 | `load_recording` | — | **Decode MCAP into DuckDB** (the LLM calls this automatically) |
 | `query` | yes | Run SQL (full DuckDB — including ASOF JOIN) |
+| `list_foxglove_recordings` | no | See recordings in Foxglove — including ones still on the robot |
+| `import_foxglove_recording` | no | Download a Foxglove recording, uploading it from the device first if needed |
 | `get_version` | no | Server version, available decoders, upgrade command |
 
 **[Project documentation](https://turkenberg.github.io/mcap_mcp_server/index.html)** — configuration, Docker, development setup, and architecture.
+
+
+## Recordings that aren't on your machine yet
+
+Set a [Foxglove](https://foxglove.dev) API key and the server can fetch recordings for you:
+
+```json
+{
+  "mcpServers": {
+    "mcap-query": {
+      "command": "uvx",
+      "args": ["mcap-mcp-server[all]"],
+      "env": { "FOXGLOVE_API_KEY": "fox_sk_..." }
+    }
+  }
+}
+```
+
+`import_foxglove_recording` downloads the recording into `<data_dir>/foxglove` and returns its path. If the recording is still sitting on the robot or edge site — Foxglove reports an `import_status` other than `complete` — the upload from the device is triggered automatically and waited for, so *"query yesterday's run from pixel-bot-1"* works even when nobody has uploaded it yet. Recordings already on disk are never re-downloaded.
 
 
 ## Example SQL (under the hood)
