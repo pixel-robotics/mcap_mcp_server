@@ -243,6 +243,7 @@ def create_server(config: ServerConfig) -> FastMCP:
         # Accumulate decoded messages per topic
         topic_columns: dict[str, dict[str, list]] = {}
         topic_field_names: dict[str, list[str] | None] = {}
+        decode_errors: dict[str, int] = {}
 
         load_start = time.monotonic()
         msg_count = 0
@@ -289,6 +290,7 @@ def create_server(config: ServerConfig) -> FastMCP:
                     )
                 except Exception:
                     logger.debug("Failed to decode message on %s", topic, exc_info=True)
+                    decode_errors[topic] = decode_errors.get(topic, 0) + 1
                     continue
 
                 if topic not in topic_columns:
@@ -354,6 +356,13 @@ def create_server(config: ServerConfig) -> FastMCP:
             result["eviction_warning"] = (
                 "Memory budget exceeded. Previously loaded tables were evicted "
                 "to make room. Use topic and time filters to reduce memory usage."
+            )
+        if decode_errors:
+            result["decode_errors"] = decode_errors
+            result["decode_error_hint"] = (
+                "Messages on these topics failed to decode and were dropped "
+                "(count per topic). A topic where every message failed gets no "
+                "table at all — that indicates a decoder bug worth reporting."
             )
         return result
 
@@ -757,6 +766,7 @@ def create_server(config: ServerConfig) -> FastMCP:
         total_rows = 0
         aliases: list[str] = []
         topic_tables: set[str] = set()
+        decode_errors: dict[str, int] = {}
         fetch_steps = len(remote)
         for i, path in enumerate(paths):
             alias = _alias_from_path(path) if use_alias else None
@@ -783,6 +793,8 @@ def create_server(config: ServerConfig) -> FastMCP:
             skipped.update(loaded["skipped_topics"])
             evicted.update(loaded.get("evicted_tables", []))
             total_rows += loaded["total_rows"]
+            for topic, count in loaded.get("decode_errors", {}).items():
+                decode_errors[topic] = decode_errors.get(topic, 0) + count
             if alias:
                 aliases.append(alias)
             for table_name in loaded["tables"]:
@@ -836,6 +848,12 @@ def create_server(config: ServerConfig) -> FastMCP:
             result["eviction_warning"] = (
                 "Memory budget exceeded. Previously loaded tables were evicted "
                 "to make room. Use topic filters or a narrower interval."
+            )
+        if decode_errors:
+            result["decode_errors"] = decode_errors
+            result["decode_error_hint"] = (
+                "Messages on these topics failed to decode and were dropped "
+                "(count per topic, summed over recordings)."
             )
         return json.dumps(result, indent=2)
 

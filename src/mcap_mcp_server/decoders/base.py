@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+
+def schema_cache_key(schema_name: str, schema_data: bytes) -> tuple[str, str]:
+    """Cache key for a parsed schema that is stable across files.
+
+    MCAP schema ids are only unique within a single file — the same id means
+    a different schema in the next file. A long-lived server loads many files,
+    so schema-derived state must be cached by content, never by id.
+    """
+    return schema_name, hashlib.sha1(schema_data).hexdigest()
 
 
 @dataclass(frozen=True)

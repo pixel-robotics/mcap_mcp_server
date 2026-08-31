@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from mcap_mcp_server.decoders.base import FieldInfo
+from mcap_mcp_server.decoders.base import FieldInfo, schema_cache_key
 from mcap_mcp_server.flatten import flatten_dict
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,8 @@ class ProtobufDecoder:
             )
         self._flatten_depth = flatten_depth
         self._factory = DecoderFactory()
-        self._decoders: dict[int, Any] = {}
+        self._decoders: dict[tuple[str, str], Any] = {}
+        self._next_synthetic_id = 0
 
     def can_decode(self, message_encoding: str, schema_encoding: str) -> bool:
         return message_encoding == "protobuf" and schema_encoding == "protobuf"
@@ -89,14 +90,22 @@ class ProtobufDecoder:
     def _get_decoder(
         self, schema_data: bytes, schema_name: str, schema_encoding: str, schema_id: int
     ) -> Any:
-        if schema_id in self._decoders:
-            return self._decoders[schema_id]
+        key = schema_cache_key(schema_name, schema_data)
+        cached = self._decoders.get(key)
+        if cached is not None:
+            return cached
+        # The mcap_protobuf factory caches by Schema.id as well, so hand it an
+        # id that is unique per schema content instead of the per-file MCAP id.
+        self._next_synthetic_id += 1
         schema_rec = Schema(
-            id=schema_id, data=schema_data, encoding=schema_encoding, name=schema_name
+            id=self._next_synthetic_id,
+            data=schema_data,
+            encoding=schema_encoding,
+            name=schema_name,
         )
         decoder_fn = self._factory.decoder_for("protobuf", schema_rec)
         if decoder_fn is not None:
-            self._decoders[schema_id] = decoder_fn
+            self._decoders[key] = decoder_fn
         return decoder_fn
 
 

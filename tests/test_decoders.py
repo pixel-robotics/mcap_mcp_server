@@ -596,7 +596,8 @@ class TestFlatBufferDecoder:
         r1 = dec.decode(bfbs, msg, schema_id=42)
         r2 = dec.decode(bfbs, msg, schema_id=42)
         assert r1 == r2
-        assert 42 in dec._schema_cache
+        # Cached by schema content, not by the per-file schema id.
+        assert len(dec._schema_cache) == 1
 
     def test_string_field_decode(self):
         """Build a FlatBuffer with a string field and decode it."""
