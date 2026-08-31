@@ -22,6 +22,8 @@ The tool resolves the request in three steps:
 
 The response reports the interval, a per-recording status list (`imported`, `already_local`, `import_started`, or `error` — one failing recording does not abort the others), the resulting `tables`, `total_rows`, memory usage, and a hint pointing to `query`. Uploading from a device can take minutes; the per-recording `device_upload_wait_s` shows where the time went.
 
+Long-running calls emit MCP progress notifications (at least every 10 s) so clients that reset their request timeout on progress don't abandon a load that is still working — an interval covering many recordings legitimately takes minutes when every topic is loaded, which is why passing `topics` is strongly recommended for wide intervals. When a load produces more than 150 tables, the response lists the recording prefixes and topic-table names once instead of enumerating every table, keeping the reply small.
+
 ## list_recordings
 
 Discover available MCAP files in the configured data directory.

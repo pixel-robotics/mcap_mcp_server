@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -51,8 +52,14 @@ def fox(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("mcap_mcp_server.server.FoxgloveClient", lambda **kw: fake)
     config = ServerConfig(data_dir=tmp_path)
     server = create_server(config)
+
+    load_interval_fn = _get_tool_fn(server, "load_interval")
+
+    def load_interval(*args, **kwargs):
+        return asyncio.run(load_interval_fn(*args, **kwargs))
+
     tools = {
-        "load_interval": _get_tool_fn(server, "load_interval"),
+        "load_interval": load_interval,
         "query": _get_tool_fn(server, "query"),
     }
     return tools, fake, config
@@ -179,6 +186,25 @@ class TestLoadInterval:
             tools["load_interval"]("2023-11-15T00:00:00Z", "2023-11-14T00:00:00Z")
         )
         assert "end must be after start" in result["error"]
+
+    def test_progress_is_reported(self, fox):
+        tools, fake, _ = fox
+        fake.recordings = [make_recording()]
+
+        class FakeCtx:
+            def __init__(self):
+                self.calls = []
+
+            async def report_progress(self, progress, total=None, message=None):
+                self.calls.append((progress, total, message))
+
+        ctx = FakeCtx()
+        result = json.loads(tools["load_interval"](*INTERVAL, ctx=ctx))
+        assert result["status"] == "loaded"
+        messages = [m for _, _, m in ctx.calls]
+        assert any("fetching recording 1/1" in m for m in messages)
+        assert any("loading recording 1/1" in m for m in messages)
+        assert messages[-1] == "done"
 
     def test_interval_is_forwarded_to_foxglove_as_utc(self, fox):
         tools, fake, _ = fox

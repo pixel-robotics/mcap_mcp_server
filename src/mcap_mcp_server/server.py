@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
 from mcap_mcp_server import __version__
 from mcap_mcp_server.auth import build_auth
@@ -65,6 +68,9 @@ def create_server(config: ServerConfig) -> FastMCP:
         max_row_limit=config.max_row_limit,
         max_memory_mb=config.max_memory_mb,
     )
+
+    # Serializes DuckDB table registration across concurrently running loads.
+    load_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Tools
@@ -305,24 +311,28 @@ def create_server(config: ServerConfig) -> FastMCP:
         total_memory_bytes = 0
         load_group = alias or Path(file_path).name
 
-        engine.drain_evicted()
+        # Loads can run concurrently (several users, or a client retrying while
+        # an earlier long load is still finishing) — registration and the
+        # read-modify-write of _recordings must not interleave.
+        with load_lock:
+            engine.drain_evicted()
 
-        for topic, cols in topic_columns.items():
-            table_name = topic_to_table_name(topic, alias)
-            df = pd.DataFrame(cols)
-            total_memory_bytes += int(df.memory_usage(deep=True).sum())
-            row_count = engine.register_dataframe(table_name, df, group=load_group)
-            tables_info[table_name] = {"rows": row_count, "columns": len(df.columns)}
-            total_rows += row_count
+            for topic, cols in topic_columns.items():
+                table_name = topic_to_table_name(topic, alias)
+                df = pd.DataFrame(cols)
+                total_memory_bytes += int(df.memory_usage(deep=True).sum())
+                row_count = engine.register_dataframe(table_name, df, group=load_group)
+                tables_info[table_name] = {"rows": row_count, "columns": len(df.columns)}
+                total_rows += row_count
 
-        _register_metadata_table(engine, summary, alias, group=load_group)
+            _register_metadata_table(engine, summary, alias, group=load_group)
 
-        if alias:
-            _register_recordings_entry(engine, summary, alias)
+            if alias:
+                _register_recordings_entry(engine, summary, alias)
+
+            evicted = engine.drain_evicted()
 
         load_time = time.monotonic() - load_start
-
-        evicted = engine.drain_evicted()
         memory_budget_mb = config.max_memory_mb
         memory_used_mb = round(engine.total_memory_bytes / (1024 * 1024), 1)
 
@@ -588,22 +598,50 @@ def create_server(config: ServerConfig) -> FastMCP:
             "first when a recording is still on the device, which can take "
             "several minutes — loads the data (restricted to the interval) into "
             "DuckDB, and returns the resulting tables. Afterwards run SQL with "
-            "the query tool. Prefer this over the individual list/import/load "
-            "tools unless you need fine-grained control."
+            "the query tool. Progress is reported while it runs; intervals "
+            "longer than a couple of minutes span many recordings, so pass "
+            "'topics' to load only what you need — that is much faster than "
+            "loading hundreds of topics per recording. Prefer this over the "
+            "individual list/import/load tools unless you need fine-grained "
+            "control."
         ),
     )
-    def load_interval(
+    async def load_interval(
         start: str,
         end: str,
         device: str | None = None,
         topics: list[str] | None = None,
         downsample: int | None = None,
+        ctx: Context | None = None,
     ) -> str:
         """Find, fetch, and load every recording overlapping [start, end]."""
         interval = _normalize_interval(start, end)
         if isinstance(interval, dict):
             return json.dumps(interval, indent=2)
         start_iso, end_iso = interval
+
+        async def progress(done: float, total: float | None, message: str) -> None:
+            if ctx is None:
+                return
+            try:
+                await ctx.report_progress(progress=done, total=total, message=message)
+            except Exception:  # progress is best-effort
+                logger.debug("Could not send progress notification", exc_info=True)
+
+        async def run_blocking(func, done: float, total: float | None, message: str):
+            """Run a blocking step in a worker thread, heartbeating progress.
+
+            The heartbeat keeps the MCP connection active so clients that reset
+            their request timeout on progress notifications don't give up on a
+            long device upload or a big load.
+            """
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(None, func)
+            while True:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(future), timeout=10)
+                except asyncio.TimeoutError:
+                    await progress(done, total, message)
 
         notes: list[str] = []
         sources: list[dict[str, Any]] = []
@@ -613,8 +651,15 @@ def create_server(config: ServerConfig) -> FastMCP:
         remote: list[FoxgloveRecording] = []
         if foxglove.configured:
             try:
-                remote = foxglove.list_recordings(
-                    device=device, start=start_iso, end=end_iso, limit=200
+                remote = await run_blocking(
+                    partial(
+                        foxglove.list_recordings,
+                        device=device,
+                        start=start_iso,
+                        end=end_iso,
+                        limit=200,
+                    ),
+                    0, None, "listing Foxglove recordings",
                 )
             except FoxgloveError as e:
                 notes.append(f"Foxglove lookup failed, falling back to local files: {e}")
@@ -640,21 +685,35 @@ def create_server(config: ServerConfig) -> FastMCP:
                     indent=2,
                 )
 
+        # Fetching and loading each count as one progress step.
+        total_steps = 2 * len(remote) if remote else None
+
         # 2. Make each remote recording local. Uploads from the devices are
         # triggered for all of them up front so they run concurrently and the
         # waits below overlap instead of adding up.
-        for rec in remote:
-            if not rec.is_imported:
-                try:
-                    foxglove.request_import(rec.id or rec.key)
-                except FoxgloveError as e:
-                    logger.warning("Could not trigger import of %s: %s", rec.id, e)
+        def trigger_imports() -> None:
+            for rec in remote:
+                if not rec.is_imported:
+                    try:
+                        foxglove.request_import(rec.id or rec.key)
+                    except FoxgloveError as e:
+                        logger.warning("Could not trigger import of %s: %s", rec.id, e)
+
+        if remote:
+            await run_blocking(
+                trigger_imports, 0, total_steps, "triggering uploads from devices"
+            )
 
         deadline = time.monotonic() + config.foxglove_import_timeout_s
-        for rec in remote:
+        for i, rec in enumerate(remote):
+            message = f"fetching recording {i + 1}/{len(remote)} ({rec.filename})"
+            await progress(i, total_steps, message)
             try:
                 remaining = max(30, int(deadline - time.monotonic()))
-                fetched = _materialize(rec, wait=True, timeout_s=remaining)
+                fetched = await run_blocking(
+                    partial(_materialize, rec, wait=True, timeout_s=remaining),
+                    i, total_steps, message,
+                )
                 sources.append(fetched)
                 paths.append(Path(fetched["path"]))
             except FoxgloveError as e:
@@ -666,9 +725,13 @@ def create_server(config: ServerConfig) -> FastMCP:
         if not paths:
             after_dt = _parse_datetime(start_iso)
             before_dt = _parse_datetime(end_iso)
-            for summary in index.scan(config.data_dir, after=after_dt, before=before_dt):
+            for summary in await run_blocking(
+                partial(index.scan, config.data_dir, after=after_dt, before=before_dt),
+                0, None, "scanning local recordings",
+            ):
                 paths.append(Path(summary.path))
                 sources.append({"status": "already_local", "path": summary.path})
+            total_steps = len(paths)
 
         if not paths:
             return json.dumps(
@@ -692,26 +755,65 @@ def create_server(config: ServerConfig) -> FastMCP:
         skipped: set[str] = set()
         evicted: set[str] = set()
         total_rows = 0
-        for path in paths:
-            loaded = _load_file(
-                path,
-                alias=_alias_from_path(path) if use_alias else None,
-                topics=topics,
-                start_time=start_iso,
-                end_time=end_iso,
-                downsample=downsample,
-            )
+        aliases: list[str] = []
+        topic_tables: set[str] = set()
+        fetch_steps = len(remote)
+        for i, path in enumerate(paths):
+            alias = _alias_from_path(path) if use_alias else None
+            message = f"loading recording {i + 1}/{len(paths)} into DuckDB ({path.name})"
+            await progress(fetch_steps + i, total_steps, message)
+            try:
+                loaded = await run_blocking(
+                    partial(
+                        _load_file,
+                        path,
+                        alias=alias,
+                        topics=topics,
+                        start_time=start_iso,
+                        end_time=end_iso,
+                        downsample=downsample,
+                    ),
+                    fetch_steps + i, total_steps, message,
+                )
+            except Exception as e:  # one bad file must not kill the rest
+                logger.warning("Failed to load %s", path, exc_info=True)
+                notes.append(f"failed to load {path.name}: {e}")
+                continue
             tables.update(loaded["tables"])
             skipped.update(loaded["skipped_topics"])
             evicted.update(loaded.get("evicted_tables", []))
             total_rows += loaded["total_rows"]
+            if alias:
+                aliases.append(alias)
+            for table_name in loaded["tables"]:
+                prefix = f"{alias}_" if alias else ""
+                topic_tables.add(table_name.removeprefix(prefix))
+
+        await progress(total_steps or 1, total_steps, "done")
+
+        # A wide interval times many topics yields thousands of tables; the
+        # per-table dict would dwarf the client's context window, so report the
+        # naming scheme instead.
+        tables_json: dict[str, Any]
+        if len(tables) > 150:
+            tables_json = {
+                "table_count": len(tables),
+                "recording_prefixes": aliases,
+                "topic_tables": sorted(topic_tables),
+                "naming": (
+                    "Tables are named <recording_prefix>_<topic_table>. Query "
+                    "one recording's table directly, or UNION across prefixes."
+                ),
+            }
+        else:
+            tables_json = tables
 
         result: dict[str, Any] = {
             "status": "loaded" if total_rows else "loaded_empty",
             "interval": {"start": start_iso, "end": end_iso},
             "device": device,
             "recordings": sources,
-            "tables": tables,
+            "tables": tables_json,
             "skipped_topics": sorted(skipped),
             "total_rows": total_rows,
             "memory_used_mb": round(engine.total_memory_bytes / (1024 * 1024), 1),
