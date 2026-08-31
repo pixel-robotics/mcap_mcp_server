@@ -5,15 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from mcap_mcp_server import __version__
+from mcap_mcp_server.auth import build_auth
 from mcap_mcp_server.config import ServerConfig
 from mcap_mcp_server.decoder_registry import DecoderRegistry
 from mcap_mcp_server.foxglove import FoxgloveClient, FoxgloveError, FoxgloveRecording
@@ -34,13 +36,17 @@ def create_server(config: ServerConfig) -> FastMCP:
         name="mcap-mcp-server",
         instructions=(
             "This server provides SQL query access to MCAP robotics recording files. "
-            "Use list_recordings to discover files, get_schema to inspect available "
-            "tables and columns, load_recording to load data into DuckDB, and query "
-            "to run SQL. All tables have a timestamp_us (BIGINT, microseconds) column "
-            "for time-based JOINs across topics. Recordings that are not on this "
-            "machine yet can be fetched from Foxglove with import_foxglove_recording, "
-            "which also triggers the upload from the robot when needed."
+            "The easiest entry point is load_interval: give it a start/end time (and "
+            "a device name), and it finds every matching recording — fetching it "
+            "from Foxglove and triggering the upload from the robot first when "
+            "needed — loads the data into DuckDB, and returns the tables. Then run "
+            "SQL with the query tool. All tables have a timestamp_us (BIGINT, "
+            "microseconds) column for time-based JOINs across topics. The "
+            "finer-grained tools (list_recordings, get_schema, load_recording, "
+            "list_foxglove_recordings, import_foxglove_recording) remain available "
+            "for step-by-step control."
         ),
+        auth=build_auth(config),
     )
 
     registry = DecoderRegistry(flatten_depth=config.flatten_depth)
@@ -185,6 +191,25 @@ def create_server(config: ServerConfig) -> FastMCP:
     ) -> str:
         """Load MCAP data into DuckDB tables."""
         file_path = _resolve_file(file, config.data_dir)
+        result = _load_file(
+            file_path,
+            alias=alias,
+            topics=topics,
+            start_time=start_time,
+            end_time=end_time,
+            downsample=downsample,
+        )
+        return json.dumps(result, indent=2)
+
+    def _load_file(
+        file_path: Path,
+        alias: str | None = None,
+        topics: list[str] | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        downsample: int | None = None,
+    ) -> dict[str, Any]:
+        """Decode an MCAP file into DuckDB tables; shared by the load tools."""
         summary = get_summary(file_path)
 
         start_ns = _parse_time_to_ns(start_time)
@@ -320,7 +345,7 @@ def create_server(config: ServerConfig) -> FastMCP:
                 "Memory budget exceeded. Previously loaded tables were evicted "
                 "to make room. Use topic and time filters to reduce memory usage."
             )
-        return json.dumps(result, indent=2)
+        return result
 
     @mcp.tool(
         name="query",
@@ -464,72 +489,253 @@ def create_server(config: ServerConfig) -> FastMCP:
             if isinstance(match, dict):
                 return json.dumps(match, indent=2)
 
-            # 3. Still on the device? Ask Foxglove to pull it in.
-            import_triggered = False
-            import_wait_s = 0.0
-            if not match.is_imported:
-                import_status = foxglove.request_import(match.id or match.key)
-                import_triggered = True
-                logger.info(
-                    "Requested Foxglove import of %s (status: %s)",
-                    match.id,
-                    import_status,
-                )
-                if not wait:
-                    return json.dumps(
-                        {
-                            "status": "import_started",
-                            "recording": match.to_json(),
-                            "import_status": import_status,
-                            "hint": (
-                                "The device is uploading the recording. Call this "
-                                "tool again in a few minutes to download it."
-                            ),
-                        },
-                        indent=2,
-                    )
-                wait_start = time.monotonic()
-                match = foxglove.wait_for_import(
-                    match.id or match.key,
-                    timeout_s=timeout_s or config.foxglove_import_timeout_s,
-                )
-                import_wait_s = time.monotonic() - wait_start
-
-            # 4. Download the MCAP bytes.
-            dest = config.foxglove_dir / _import_filename(match, topics, start, end)
-            if dest.exists() and not force:
-                downloaded_bytes = dest.stat().st_size
-                status = "already_local"
-            else:
-                download_start = time.monotonic()
-                downloaded_bytes = foxglove.download_recording(
-                    match, dest, topics=topics, start=start, end=end
-                )
-                logger.info(
-                    "Downloaded %s (%.1f MB) in %.1fs",
-                    dest,
-                    downloaded_bytes / (1024 * 1024),
-                    time.monotonic() - download_start,
-                )
-                status = "imported"
+            result = _materialize(
+                match,
+                topics=topics,
+                start=start,
+                end=end,
+                force=force,
+                wait=wait,
+                timeout_s=timeout_s,
+            )
         except FoxgloveError as e:
             return json.dumps({"error": str(e)}, indent=2)
 
+        if result["status"] == "import_started":
+            result["hint"] = (
+                "The device is uploading the recording. Call this tool again "
+                "in a few minutes to download it."
+            )
+        else:
+            result["hint"] = "Call load_recording with this path to query it."
+        return json.dumps(result, indent=2)
+
+    def _materialize(
+        match: FoxgloveRecording,
+        topics: list[str] | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        force: bool = False,
+        wait: bool = True,
+        timeout_s: int | None = None,
+    ) -> dict[str, Any]:
+        """Turn a remote Foxglove recording into a local MCAP file.
+
+        Triggers the upload from the device when the recording has not been
+        imported yet, then downloads it. Raises FoxgloveError on failure.
+        """
+        # Still on the device? Ask Foxglove to pull it in.
+        import_triggered = False
+        import_wait_s = 0.0
+        if not match.is_imported:
+            import_status = foxglove.request_import(match.id or match.key)
+            import_triggered = True
+            logger.info(
+                "Requested Foxglove import of %s (status: %s)",
+                match.id,
+                import_status,
+            )
+            if not wait:
+                return {
+                    "status": "import_started",
+                    "recording": match.to_json(),
+                    "import_status": import_status,
+                }
+            wait_start = time.monotonic()
+            match = foxglove.wait_for_import(
+                match.id or match.key,
+                timeout_s=timeout_s or config.foxglove_import_timeout_s,
+            )
+            import_wait_s = time.monotonic() - wait_start
+
+        # Download the MCAP bytes.
+        dest = config.foxglove_dir / _import_filename(match, topics, start, end)
+        if dest.exists() and not force:
+            downloaded_bytes = dest.stat().st_size
+            status = "already_local"
+        else:
+            download_start = time.monotonic()
+            downloaded_bytes = foxglove.download_recording(
+                match, dest, topics=topics, start=start, end=end
+            )
+            logger.info(
+                "Downloaded %s (%.1f MB) in %.1fs",
+                dest,
+                downloaded_bytes / (1024 * 1024),
+                time.monotonic() - download_start,
+            )
+            status = "imported"
+
         index.invalidate()
 
-        return json.dumps(
-            {
-                "status": status,
-                "path": str(dest),
-                "file": dest.name,
-                "size_mb": round(downloaded_bytes / (1024 * 1024), 1),
-                "recording": match.to_json(),
-                "uploaded_from_device": import_triggered,
-                "device_upload_wait_s": round(import_wait_s, 1),
-                "hint": "Call load_recording with this path to query it.",
-            },
-            indent=2,
-        )
+        return {
+            "status": status,
+            "path": str(dest),
+            "file": dest.name,
+            "size_mb": round(downloaded_bytes / (1024 * 1024), 1),
+            "recording": match.to_json(),
+            "uploaded_from_device": import_triggered,
+            "device_upload_wait_s": round(import_wait_s, 1),
+        }
+
+    @mcp.tool(
+        name="load_interval",
+        description=(
+            "One-stop tool: make all recorded data for a time interval queryable "
+            "with SQL. Give start and end (ISO 8601) and usually a device name. "
+            "The tool finds every recording overlapping the interval, fetches "
+            "missing ones from Foxglove — triggering the upload from the robot "
+            "first when a recording is still on the device, which can take "
+            "several minutes — loads the data (restricted to the interval) into "
+            "DuckDB, and returns the resulting tables. Afterwards run SQL with "
+            "the query tool. Prefer this over the individual list/import/load "
+            "tools unless you need fine-grained control."
+        ),
+    )
+    def load_interval(
+        start: str,
+        end: str,
+        device: str | None = None,
+        topics: list[str] | None = None,
+        downsample: int | None = None,
+    ) -> str:
+        """Find, fetch, and load every recording overlapping [start, end]."""
+        interval = _normalize_interval(start, end)
+        if isinstance(interval, dict):
+            return json.dumps(interval, indent=2)
+        start_iso, end_iso = interval
+
+        notes: list[str] = []
+        sources: list[dict[str, Any]] = []
+        paths: list[Path] = []
+
+        # 1. Ask Foxglove which recordings overlap the interval.
+        remote: list[FoxgloveRecording] = []
+        if foxglove.configured:
+            try:
+                remote = foxglove.list_recordings(
+                    device=device, start=start_iso, end=end_iso, limit=200
+                )
+            except FoxgloveError as e:
+                notes.append(f"Foxglove lookup failed, falling back to local files: {e}")
+        else:
+            notes.append(
+                "No Foxglove API key configured — only recordings already on "
+                "this machine were considered."
+            )
+
+        if device is None and remote:
+            devices = sorted(
+                {rec.device_name or rec.device_id for rec in remote} - {""}
+            )
+            if len(devices) > 1:
+                return json.dumps(
+                    {
+                        "error": (
+                            f"Recordings from {len(devices)} devices overlap "
+                            "this interval. Pass 'device' to pick one."
+                        ),
+                        "devices": devices,
+                    },
+                    indent=2,
+                )
+
+        # 2. Make each remote recording local. Uploads from the devices are
+        # triggered for all of them up front so they run concurrently and the
+        # waits below overlap instead of adding up.
+        for rec in remote:
+            if not rec.is_imported:
+                try:
+                    foxglove.request_import(rec.id or rec.key)
+                except FoxgloveError as e:
+                    logger.warning("Could not trigger import of %s: %s", rec.id, e)
+
+        deadline = time.monotonic() + config.foxglove_import_timeout_s
+        for rec in remote:
+            try:
+                remaining = max(30, int(deadline - time.monotonic()))
+                fetched = _materialize(rec, wait=True, timeout_s=remaining)
+                sources.append(fetched)
+                paths.append(Path(fetched["path"]))
+            except FoxgloveError as e:
+                sources.append(
+                    {"status": "error", "recording": rec.to_json(), "error": str(e)}
+                )
+
+        # 3. No Foxglove results? Fall back to what is already on disk.
+        if not paths:
+            after_dt = _parse_datetime(start_iso)
+            before_dt = _parse_datetime(end_iso)
+            for summary in index.scan(config.data_dir, after=after_dt, before=before_dt):
+                paths.append(Path(summary.path))
+                sources.append({"status": "already_local", "path": summary.path})
+
+        if not paths:
+            return json.dumps(
+                {
+                    "error": "No recordings overlap this interval.",
+                    "interval": {"start": start_iso, "end": end_iso},
+                    "device": device,
+                    "recordings": sources,
+                    "notes": notes,
+                    "hint": (
+                        "Check the device name and time window with "
+                        "list_foxglove_recordings or list_recordings."
+                    ),
+                },
+                indent=2,
+            )
+
+        # 4. Load everything into DuckDB, restricted to the interval.
+        use_alias = len(paths) > 1
+        tables: dict[str, Any] = {}
+        skipped: set[str] = set()
+        evicted: set[str] = set()
+        total_rows = 0
+        for path in paths:
+            loaded = _load_file(
+                path,
+                alias=_alias_from_path(path) if use_alias else None,
+                topics=topics,
+                start_time=start_iso,
+                end_time=end_iso,
+                downsample=downsample,
+            )
+            tables.update(loaded["tables"])
+            skipped.update(loaded["skipped_topics"])
+            evicted.update(loaded.get("evicted_tables", []))
+            total_rows += loaded["total_rows"]
+
+        result: dict[str, Any] = {
+            "status": "loaded" if total_rows else "loaded_empty",
+            "interval": {"start": start_iso, "end": end_iso},
+            "device": device,
+            "recordings": sources,
+            "tables": tables,
+            "skipped_topics": sorted(skipped),
+            "total_rows": total_rows,
+            "memory_used_mb": round(engine.total_memory_bytes / (1024 * 1024), 1),
+            "memory_budget_mb": config.max_memory_mb,
+            "hint": (
+                "Data is loaded — run SQL with the query tool. Every table has "
+                "a timestamp_us column (BIGINT, microseconds) for JOINs; use "
+                "get_schema for column details."
+            ),
+        }
+        if total_rows == 0:
+            result["hint"] = (
+                "Recordings were found but contained no decodable messages in "
+                "this interval (or all topics were filtered out)."
+            )
+        if notes:
+            result["notes"] = notes
+        if evicted:
+            result["evicted_tables"] = sorted(evicted)
+            result["eviction_warning"] = (
+                "Memory budget exceeded. Previously loaded tables were evicted "
+                "to make room. Use topic filters or a narrower interval."
+            )
+        return json.dumps(result, indent=2)
 
     @mcp.tool(
         name="get_version",
@@ -662,6 +868,42 @@ def _resolve_foxglove_recording(
         }
 
     return matches[0]
+
+
+def _normalize_interval(start: str, end: str) -> tuple[str, str] | dict[str, str]:
+    """Parse and validate an interval, returning UTC ISO strings or an error dict.
+
+    Naive timestamps are taken as UTC; the returned strings are RFC 3339 with a
+    'Z' suffix, the form the Foxglove API expects.
+    """
+    start_dt = _parse_datetime(start)
+    end_dt = _parse_datetime(end)
+    if start_dt is None or end_dt is None:
+        return {
+            "error": (
+                "start and end must be ISO 8601 timestamps, "
+                "e.g. 2026-08-30T14:00:00Z."
+            )
+        }
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    if end_dt <= start_dt:
+        return {"error": "end must be after start."}
+
+    def fmt(dt: datetime) -> str:
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    return fmt(start_dt), fmt(end_dt)
+
+
+def _alias_from_path(path: Path) -> str:
+    """SQL-safe table prefix derived from a file name."""
+    stem = re.sub(r"[^A-Za-z0-9_]", "_", Path(path).stem).strip("_") or "rec"
+    if stem[0].isdigit():
+        stem = f"r_{stem}"
+    return stem
 
 
 def _normalize_iso(value: str) -> str:

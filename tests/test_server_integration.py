@@ -146,7 +146,6 @@ class TestLoadRecordingMemoryInfo:
 
 def _get_tool_fn(server, name: str):
     """Extract a tool's callable from the FastMCP server by name."""
-    for tool in server._tool_manager._tools.values():
-        if tool.name == name:
-            return tool.fn
-    raise ValueError(f"Tool {name!r} not found")
+    import asyncio
+
+    return asyncio.run(server.get_tool(name)).fn

@@ -16,7 +16,7 @@ graph TD
     Cloud["Foxglove API<br/>+ robots / edge sites"]
 
     Client -->|"list_recordings<br/>get_recording_info<br/>get_schema<br/>get_version"| Server
-    Client -->|load_recording| Server
+    Client -->|"load_interval<br/>load_recording"| Server
     Client -->|query| Server
     Client -->|"list_foxglove_recordings<br/>import_foxglove_recording"| Server
 
@@ -38,8 +38,9 @@ graph TD
 
 | Module | Role |
 |--------|------|
-| `server.py` | MCP tool registration (8 tools), request orchestration |
+| `server.py` | MCP tool registration (9 tools), request orchestration |
 | `config.py` | Config loading: defaults → TOML → env vars → CLI. Validates `max_memory_mb >= 64` |
+| `auth.py` | Google Workspace login for the HTTP transport: OAuth proxy in front of Google plus a token verifier that rejects accounts outside the allowed domains |
 | `foxglove.py` | Foxglove Data Platform REST client: find recordings, trigger an upload from the device, download MCAP |
 | `recording_index.py` | Scans directories for `.mcap` files, caches summaries, filters by date |
 | `mcap_reader.py` | Reads MCAP summary and iterates messages using indexed reader |
@@ -70,6 +71,12 @@ graph TD
 5. The recording index is invalidated so the new file appears in `list_recordings`, and the path is handed back for `load_recording`
 
 Only the standard library is used for HTTP, so the Foxglove tools add no dependencies.
+
+`load_interval` composes the two paths: it lists every Foxglove recording overlapping the requested interval (falling back to the local index without an API key), triggers all pending device uploads up front so they run concurrently, materializes each recording exactly like the import path, and then runs the load path per file restricted to the interval — aliasing table names when more than one recording is loaded.
+
+## Remote serving and authentication
+
+With `MCAP_TRANSPORT=http` the same FastMCP server is exposed over streamable HTTP. `auth.py` fronts it with an OAuth proxy to Google (fastmcp's `GoogleProvider`): the server publishes the standard MCP OAuth discovery metadata, clients register dynamically and send the user through the Google login, and every request's token is verified against Google. A `WorkspaceTokenVerifier` layered on top rejects any verified-email domain not in `allowed_google_domains`, so authentication *and* authorization are enforced server-side. An HTTP server without a configured Google client refuses to start unless `MCAP_INSECURE_NO_AUTH=true` is set explicitly.
 
 ## Memory management
 

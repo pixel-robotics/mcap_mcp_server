@@ -203,3 +203,45 @@ class TestFoxgloveConfig:
         assert cfg.foxglove_api_key == "from_env"
         assert cfg.foxglove_dir == Path("/env/bags")
         assert cfg.foxglove_import_timeout_s == 60
+
+
+class TestAuthConfig:
+    def test_defaults(self):
+        cfg = ServerConfig()
+        assert cfg.google_client_id == ""
+        assert cfg.allowed_google_domains == []
+        assert cfg.insecure_no_auth is False
+
+    def test_from_toml(self, tmp_path: Path):
+        toml_file = tmp_path / "cfg.toml"
+        toml_file.write_text(
+            textwrap.dedent(
+                """
+                [server]
+                base_url = "https://mcap.example.com"
+
+                [auth]
+                google_client_id = "cid.apps.googleusercontent.com"
+                google_client_secret = "sec"
+                allowed_domains = ["lvairo.com", "Pixel-Robotics.EU"]
+                """
+            )
+        )
+        cfg = load_config(toml_path=toml_file)
+        assert cfg.base_url == "https://mcap.example.com"
+        assert cfg.google_client_id == "cid.apps.googleusercontent.com"
+        assert cfg.google_client_secret == "sec"
+        assert cfg.allowed_google_domains == ["lvairo.com", "pixel-robotics.eu"]
+
+    def test_from_env(self, monkeypatch):
+        monkeypatch.setenv("MCAP_BASE_URL", "https://mcap.example.com")
+        monkeypatch.setenv("MCAP_GOOGLE_CLIENT_ID", "cid")
+        monkeypatch.setenv("MCAP_GOOGLE_CLIENT_SECRET", "sec")
+        monkeypatch.setenv("MCAP_ALLOWED_GOOGLE_DOMAINS", "lvairo.com, @other.com")
+        monkeypatch.setenv("MCAP_INSECURE_NO_AUTH", "true")
+        cfg = load_config()
+        assert cfg.base_url == "https://mcap.example.com"
+        assert cfg.google_client_id == "cid"
+        assert cfg.google_client_secret == "sec"
+        assert cfg.allowed_google_domains == ["lvairo.com", "other.com"]
+        assert cfg.insecure_no_auth is True

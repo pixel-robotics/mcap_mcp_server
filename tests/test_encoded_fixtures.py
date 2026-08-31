@@ -43,10 +43,10 @@ except ImportError:
 
 
 def _get_tool_fn(server, name: str):
-    for tool in server._tool_manager._tools.values():
-        if tool.name == name:
-            return tool.fn
-    raise ValueError(f"Tool {name!r} not found")
+    """Extract a tool's callable from the FastMCP server by name."""
+    import asyncio
+
+    return asyncio.run(server.get_tool(name)).fn
 
 
 def _make_server(mcap_path: Path):

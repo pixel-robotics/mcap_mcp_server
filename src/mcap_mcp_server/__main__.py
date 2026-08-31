@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from mcap_mcp_server.auth import AuthConfigError
 from mcap_mcp_server.config import load_config
 from mcap_mcp_server.server import create_server
 
@@ -22,15 +23,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse"],
+        choices=["stdio", "http", "sse"],
         default=None,
-        help="MCP transport (default: stdio)",
+        help="MCP transport (default: stdio; use http for a remote server)",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Port for SSE transport (default: 8080)",
+        help="Port for http/sse transport (default: 8080)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Public URL of this server, required for Google auth "
+        "(overrides MCAP_BASE_URL)",
     )
     parser.add_argument(
         "--config",
@@ -59,14 +66,19 @@ def main(argv: list[str] | None = None) -> None:
         cli_overrides["sse_port"] = args.port
     if args.log_level is not None:
         cli_overrides["log_level"] = args.log_level
+    if args.base_url is not None:
+        cli_overrides["base_url"] = args.base_url
 
     config = load_config(toml_path=args.config, cli_overrides=cli_overrides)
     config.configure_logging()
 
-    server = create_server(config)
+    try:
+        server = create_server(config)
+    except AuthConfigError as e:
+        raise SystemExit(f"error: {e}") from e
 
-    if config.transport == "sse":
-        server.run(transport="sse", host="0.0.0.0", port=config.sse_port)
+    if config.transport in ("http", "sse"):
+        server.run(transport=config.transport, host="0.0.0.0", port=config.sse_port)
     else:
         server.run(transport="stdio")
 

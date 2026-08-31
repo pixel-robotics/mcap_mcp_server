@@ -37,6 +37,12 @@ class ServerConfig:
     foxglove_api_url: str = "https://api.foxglove.dev"
     foxglove_download_dir: Path | None = None
     foxglove_import_timeout_s: int = 900
+    # Remote (HTTP) serving: OAuth via Google, restricted to Workspace domains.
+    base_url: str = ""
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    allowed_google_domains: list[str] = field(default_factory=list)
+    insecure_no_auth: bool = False
 
     def __post_init__(self) -> None:
         if self.max_memory_mb < 64:
@@ -79,6 +85,15 @@ def _bool_env(value: str) -> bool:
     return value.lower() in ("1", "true", "yes")
 
 
+def _domain_list(value) -> list[str]:
+    """Accept a TOML list or a comma-separated string of domains."""
+    if isinstance(value, str):
+        parts = value.split(",")
+    else:
+        parts = list(value)
+    return [p.strip().lstrip("@").lower() for p in parts if p and p.strip()]
+
+
 def load_config(
     toml_path: Path | None = None,
     cli_overrides: dict | None = None,
@@ -94,6 +109,7 @@ def load_config(
     decoder_section = toml_data.get("decoder", {})
     logging_section = toml_data.get("logging", {})
     foxglove_section = toml_data.get("foxglove", {})
+    auth_section = toml_data.get("auth", {})
 
     cfg = ServerConfig(
         data_dir=Path(server_section.get("data_dir", ".")),
@@ -109,6 +125,11 @@ def load_config(
         foxglove_api_url=foxglove_section.get("api_url", "https://api.foxglove.dev"),
         foxglove_download_dir=_optional_path(foxglove_section.get("download_dir")),
         foxglove_import_timeout_s=foxglove_section.get("import_timeout_s", 900),
+        base_url=server_section.get("base_url", ""),
+        google_client_id=auth_section.get("google_client_id", ""),
+        google_client_secret=auth_section.get("google_client_secret", ""),
+        allowed_google_domains=_domain_list(auth_section.get("allowed_domains", [])),
+        insecure_no_auth=auth_section.get("insecure_no_auth", False),
     )
 
     env_map = {
@@ -127,6 +148,11 @@ def load_config(
         "MCAP_FOXGLOVE_API_URL": ("foxglove_api_url", str),
         "MCAP_FOXGLOVE_DOWNLOAD_DIR": ("foxglove_download_dir", Path),
         "MCAP_FOXGLOVE_IMPORT_TIMEOUT_S": ("foxglove_import_timeout_s", int),
+        "MCAP_BASE_URL": ("base_url", str),
+        "MCAP_GOOGLE_CLIENT_ID": ("google_client_id", str),
+        "MCAP_GOOGLE_CLIENT_SECRET": ("google_client_secret", str),
+        "MCAP_ALLOWED_GOOGLE_DOMAINS": ("allowed_google_domains", _domain_list),
+        "MCAP_INSECURE_NO_AUTH": ("insecure_no_auth", _bool_env),
     }
     for env_key, (attr, converter) in env_map.items():
         val = os.environ.get(env_key)

@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from mcap_mcp_server.__main__ import main, parse_args
 
 
@@ -71,3 +73,24 @@ class TestMain:
         assert config.transport == "sse"
         assert config.sse_port == 7777
         assert config.log_level == "ERROR"
+
+
+class TestHttpTransport:
+    def test_http_transport_is_accepted(self):
+        args = parse_args(["--transport", "http", "--base-url", "https://x.example"])
+        assert args.transport == "http"
+        assert args.base_url == "https://x.example"
+
+    @patch("mcap_mcp_server.__main__.create_server")
+    def test_http_run_call(self, mock_create, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("MCAP_INSECURE_NO_AUTH", "true")
+        mock_server = MagicMock()
+        mock_create.return_value = mock_server
+        main(["--data-dir", str(tmp_path), "--transport", "http", "--port", "9999"])
+        mock_server.run.assert_called_once_with(
+            transport="http", host="0.0.0.0", port=9999
+        )
+
+    def test_http_without_auth_exits_with_clean_error(self, tmp_path: Path):
+        with pytest.raises(SystemExit, match="Refusing to serve"):
+            main(["--data-dir", str(tmp_path), "--transport", "http"])

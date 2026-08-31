@@ -1,6 +1,26 @@
 # MCP Tools
 
-Eight tools are exposed via the Model Context Protocol. Typical workflow: `list_recordings` → `get_schema` → `load_recording` → `query`. When the recording is not on this machine yet, start with `list_foxglove_recordings` → `import_foxglove_recording` instead.
+Nine tools are exposed via the Model Context Protocol. The shortest path is `load_interval` → `query`: one call makes all data for a time window queryable, wherever it currently lives. The step-by-step workflow — `list_recordings` → `get_schema` → `load_recording` → `query`, with `list_foxglove_recordings` → `import_foxglove_recording` for remote recordings — remains available for fine-grained control.
+
+## load_interval
+
+One-stop tool: make all recorded data for a time interval queryable with SQL. It finds every recording overlapping the interval, fetches missing ones from Foxglove — triggering the upload from the robot first when a recording is still on the device — loads the data restricted to the interval into DuckDB, and returns the resulting tables.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `start` | string | Yes | ISO 8601 timestamp — start of the interval (naive times are taken as UTC) |
+| `end` | string | Yes | ISO 8601 timestamp — end of the interval |
+| `device` | string | No | Device name or id. Required if recordings from several devices overlap the interval |
+| `topics` | string[] | No | Subset of topics to load (defaults to all decodable) |
+| `downsample` | integer | No | Keep every Nth message |
+
+The tool resolves the request in three steps:
+
+1. **Discover.** Foxglove is asked for every recording of the device overlapping the interval. If recordings from more than one device match and no `device` was given, the tool returns the device names instead of guessing. Without a Foxglove API key (or when the lookup fails), recordings already on disk that overlap the interval are used instead.
+2. **Materialize.** Each remote recording is turned into a local file, exactly like `import_foxglove_recording` would: already-local files are reused, device uploads are triggered for all pending recordings up front (so the uploads run concurrently and the waits overlap), and completed imports are downloaded in full so later intervals hit the cache.
+3. **Load.** Every file is decoded into DuckDB restricted to `[start, end]` (and `topics`, if given). A single recording gets plain table names; several recordings are prefixed with an alias derived from the file name (`session_042_battery`, …).
+
+The response reports the interval, a per-recording status list (`imported`, `already_local`, `import_started`, or `error` — one failing recording does not abort the others), the resulting `tables`, `total_rows`, memory usage, and a hint pointing to `query`. Uploading from a device can take minutes; the per-recording `device_upload_wait_s` shows where the time went.
 
 ## list_recordings
 

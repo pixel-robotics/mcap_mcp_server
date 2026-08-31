@@ -37,6 +37,7 @@ Just talk to your LLM:
 
 | Tool | Needs loading | What it does |
 |------|:---:|-------------|
+| `load_interval` | — | **One call: fetch + load everything for a time interval** — pulls recordings from Foxglove and from the robot itself when needed |
 | `list_recordings` | no | Find MCAP files in your project (or any path) |
 | `get_recording_info` | no | Metadata, channels, attachments for a file |
 | `get_schema` | no | SQL table names & column types — for query planning |
@@ -66,6 +67,23 @@ Set a [Foxglove](https://foxglove.dev) API key and the server can fetch recordin
 ```
 
 `import_foxglove_recording` downloads the recording into `<data_dir>/foxglove` and returns its path. If the recording is still sitting on the robot or edge site — Foxglove reports an `import_status` other than `complete` — the upload from the device is triggered automatically and waited for, so *"query yesterday's run from pixel-bot-1"* works even when nobody has uploaded it yet. Recordings already on disk are never re-downloaded.
+
+`load_interval` goes one step further: *"load the data from pixel-bot-1 between 14:00 and 14:30"* is a single tool call that discovers all matching recordings, fetches whatever is missing (uploading from the robot first when needed), and loads the interval into DuckDB, ready for SQL.
+
+
+## Run it as a shared server for your team
+
+The same server can be deployed once and used by the whole team over HTTP, protected by Google Workspace login — only accounts on your Workspace domain get in, verified server-side on every request. Team members just add a URL to their MCP client; the Foxglove key stays on the server:
+
+```json
+{
+  "mcpServers": {
+    "mcap-query": { "url": "https://mcap.example.com/mcp" }
+  }
+}
+```
+
+See [Remote server with Google Workspace login](https://turkenberg.github.io/mcap_mcp_server/configuration.html) for the Docker command and the Google OAuth client setup.
 
 
 ## Example SQL (under the hood)
