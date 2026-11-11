@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import threading
 import time
 from collections import OrderedDict
 from typing import Any
@@ -47,6 +48,13 @@ class QueryEngine:
         max_memory_mb: int = 2048,
     ) -> None:
         self._conn = duckdb.connect(database=":memory:")
+        # One DuckDB connection is shared by every thread (tool calls run in
+        # AnyIO worker threads, loads in the asyncio executor). All access goes
+        # through this lock: otherwise a register() that holds the GIL while
+        # waiting for DuckDB's connection mutex deadlocks against a query that
+        # holds the mutex and needs the GIL to scan a pandas DataFrame, and the
+        # whole server (event loop included) stops responding.
+        self._lock = threading.RLock()
         self._query_timeout_s = query_timeout_s
         self._default_row_limit = default_row_limit
         self._max_row_limit = max_row_limit
@@ -78,17 +86,18 @@ class QueryEngine:
         recording alias or filename).  Returns the number of rows registered.
         """
         mem = int(df.memory_usage(deep=True).sum())
-        self._evict_if_needed(mem)
+        with self._lock:
+            self._evict_if_needed(mem)
 
-        self._conn.register(name, df)
-        row_count = len(df)
-        self._tables[name] = row_count
-        self._table_memory[name] = mem
+            self._conn.register(name, df)
+            row_count = len(df)
+            self._tables[name] = row_count
+            self._table_memory[name] = mem
 
-        if group not in self._groups:
-            self._groups[group] = []
-        self._groups[group].append(name)
-        self._groups.move_to_end(group)
+            if group not in self._groups:
+                self._groups[group] = []
+            self._groups[group].append(name)
+            self._groups.move_to_end(group)
 
         logger.info("Registered table %r (%d rows, %d cols)", name, row_count, len(df.columns))
         return row_count
@@ -116,15 +125,17 @@ class QueryEngine:
         return evicted
 
     def unregister(self, name: str) -> None:
-        self._do_unregister(name)
-        for group, tables in self._groups.items():
-            if name in tables:
-                tables.remove(name)
-                break
+        with self._lock:
+            self._do_unregister(name)
+            for group, tables in self._groups.items():
+                if name in tables:
+                    tables.remove(name)
+                    break
 
     def _do_unregister(self, name: str) -> None:
         try:
-            self._conn.unregister(name)
+            with self._lock:
+                self._conn.unregister(name)
         except duckdb.Error:
             pass
         self._tables.pop(name, None)
@@ -193,17 +204,32 @@ class QueryEngine:
     def _execute_with_timeout(self, sql: str) -> tuple[list, list]:
         """Run a SQL statement with a timeout, interrupting DuckDB if exceeded."""
 
-        def _run() -> tuple[list, list]:
-            result = self._conn.execute(sql)
-            return result.description, result.fetchall()
+        state = {"started": False, "abandoned": False}
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        def _run() -> tuple[list, list]:
+            with self._lock:
+                if state["abandoned"]:  # timed out while waiting for the lock
+                    return [], []
+                state["started"] = True
+                result = self._conn.execute(sql)
+                return result.description, result.fetchall()
+
+        # No `with` block: its __exit__ would wait for a timed-out query to
+        # finish, so the timeout would never actually return to the caller.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
             future = pool.submit(_run)
             try:
                 return future.result(timeout=self._query_timeout_s)
             except concurrent.futures.TimeoutError:
-                self._conn.interrupt()
+                state["abandoned"] = True
+                # Only interrupt if *this* query holds the connection, not one
+                # queued behind it. interrupt() just sets a flag; no lock needed.
+                if state["started"]:
+                    self._conn.interrupt()
                 raise _QueryTimeout
+        finally:
+            pool.shutdown(wait=False)
 
     def _check_sql_safety(self, sql: str) -> None:
         upper = sql.upper()
@@ -217,7 +243,8 @@ class QueryEngine:
                 raise ValueError(f"Blocked SQL function: {fn}")
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 def _elapsed_ms(start: float) -> int:
