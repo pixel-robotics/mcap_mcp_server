@@ -12,6 +12,7 @@ a minimal reflection parser for the .bfbs format.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import struct
 from typing import Any
@@ -87,7 +88,8 @@ class FlatBufferDecoder:
                 "Install with: pip install mcap-mcp-server[flatbuffers]"
             )
         self._flatten_depth = flatten_depth
-        self._schema_cache: dict[int, list[_FieldDef]] = {}
+        # Keyed by schema content — MCAP schema ids are only unique per file.
+        self._schema_cache: dict[str, list[_FieldDef]] = {}
 
     def can_decode(self, message_encoding: str, schema_encoding: str) -> bool:
         return message_encoding == "flatbuffer" and schema_encoding == "flatbuffer"
@@ -129,11 +131,12 @@ class FlatBufferDecoder:
             return []
 
     def _get_field_defs(self, schema: bytes, schema_id: int) -> list[_FieldDef]:
-        if schema_id in self._schema_cache:
-            return self._schema_cache[schema_id]
+        key = hashlib.sha1(schema).hexdigest()
+        cached = self._schema_cache.get(key)
+        if cached is not None:
+            return cached
         field_defs = _parse_bfbs_schema(schema)
-        if schema_id:
-            self._schema_cache[schema_id] = field_defs
+        self._schema_cache[key] = field_defs
         return field_defs
 
 

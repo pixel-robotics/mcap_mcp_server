@@ -7,7 +7,7 @@ import re
 from types import SimpleNamespace
 from typing import Any
 
-from mcap_mcp_server.decoders.base import NUMERIC_TYPE_MAP, FieldInfo
+from mcap_mcp_server.decoders.base import NUMERIC_TYPE_MAP, FieldInfo, schema_cache_key
 from mcap_mcp_server.flatten import flatten_dict
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,8 @@ class Ros2Decoder:
             )
         self._flatten_depth = flatten_depth
         self._factory = DecoderFactory()
-        self._decoders: dict[int, Any] = {}
+        self._decoders: dict[tuple[str, str], Any] = {}
+        self._next_synthetic_id = 0
 
     def can_decode(self, message_encoding: str, schema_encoding: str) -> bool:
         return message_encoding == "cdr" and schema_encoding in ("ros2msg", "ros2idl")
@@ -69,16 +70,24 @@ class Ros2Decoder:
     def _get_decoder(
         self, schema_data: bytes, schema_name: str, schema_encoding: str, schema_id: int
     ) -> Any:
-        if schema_id in self._decoders:
-            return self._decoders[schema_id]
+        key = schema_cache_key(schema_name, schema_data)
+        cached = self._decoders.get(key)
+        if cached is not None:
+            return cached
 
         effective_encoding = "ros2msg" if schema_encoding in ("ros2msg", "ros2idl") else schema_encoding
+        # The mcap_ros2 factory caches by Schema.id as well, so hand it an id
+        # that is unique per schema content instead of the per-file MCAP id.
+        self._next_synthetic_id += 1
         schema_rec = Schema(
-            id=schema_id, data=schema_data, encoding=effective_encoding, name=schema_name
+            id=self._next_synthetic_id,
+            data=schema_data,
+            encoding=effective_encoding,
+            name=schema_name,
         )
         decoder_fn = self._factory.decoder_for("cdr", schema_rec)
         if decoder_fn is not None:
-            self._decoders[schema_id] = decoder_fn
+            self._decoders[key] = decoder_fn
         return decoder_fn
 
 
