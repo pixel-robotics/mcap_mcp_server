@@ -203,6 +203,7 @@ def create_server(config: ServerConfig) -> FastMCP:
         # Accumulate decoded messages per topic
         topic_columns: dict[str, dict[str, list]] = {}
         topic_field_names: dict[str, list[str] | None] = {}
+        decode_errors: dict[str, int] = {}
 
         load_start = time.monotonic()
         msg_count = 0
@@ -249,6 +250,7 @@ def create_server(config: ServerConfig) -> FastMCP:
                     )
                 except Exception:
                     logger.debug("Failed to decode message on %s", topic, exc_info=True)
+                    decode_errors[topic] = decode_errors.get(topic, 0) + 1
                     continue
 
                 if topic not in topic_columns:
@@ -314,6 +316,13 @@ def create_server(config: ServerConfig) -> FastMCP:
             result["eviction_warning"] = (
                 "Memory budget exceeded. Previously loaded tables were evicted "
                 "to make room. Use topic and time filters to reduce memory usage."
+            )
+        if decode_errors:
+            result["decode_errors"] = decode_errors
+            result["decode_error_hint"] = (
+                "Messages on these topics failed to decode and were dropped "
+                "(count per topic). A topic where every message failed gets no "
+                "table at all — that indicates a decoder bug worth reporting."
             )
         return json.dumps(result, indent=2)
 

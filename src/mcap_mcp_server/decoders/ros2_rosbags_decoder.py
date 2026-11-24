@@ -9,7 +9,7 @@ import logging
 from dataclasses import fields, is_dataclass
 from typing import Any, Callable
 
-from mcap_mcp_server.decoders.base import FieldInfo
+from mcap_mcp_server.decoders.base import FieldInfo, schema_cache_key
 from mcap_mcp_server.decoders.ros2_decoder import Ros2Decoder
 from mcap_mcp_server.flatten import flatten_dict
 
@@ -34,8 +34,10 @@ class Ros2RosbagsDecoder:
             )
         self._flatten_depth = flatten_depth
         self._store = get_typestore(Stores.LATEST)
-        # schema_id -> bound decode function (rosbags or fallback). None until first message.
-        self._decoders: dict[int, Callable[[bytes, str], dict[str, Any]]] = {}
+        # Bound decode function (rosbags or fallback) per schema *content*.
+        # MCAP schema ids are only unique within one file; keying by id made
+        # every later file reuse the first file's decoders (AMRNAV-8483).
+        self._decoders: dict[tuple[str, str], Callable[[bytes, str], dict[str, Any]]] = {}
         self._fallback: Ros2Decoder | None = None
 
     def can_decode(self, message_encoding: str, schema_encoding: str) -> bool:
@@ -51,10 +53,11 @@ class Ros2RosbagsDecoder:
         schema_id: int = 0,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        fn = self._decoders.get(schema_id)
+        key = schema_cache_key(schema_name, schema)
+        fn = self._decoders.get(key)
         if fn is None:
             fn = self._prepare(schema, schema_name, schema_encoding, schema_id)
-            self._decoders[schema_id] = fn
+            self._decoders[key] = fn
         return fn(data, schema_name)
 
     def get_field_info(self, schema: bytes, schema_encoding: str) -> list[FieldInfo]:

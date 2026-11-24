@@ -108,8 +108,13 @@ class TestFlatBufferDecoder:
             _FB_INT,
         )
 
+        import hashlib
+
         dec = FlatBufferDecoder()
-        dec._schema_cache[42] = [_FieldDef("cached", _FB_INT, 4)]
+        # The cache is keyed by schema content — per-file schema ids collide
+        # across files, so they must not be used as keys.
+        key = hashlib.sha1(b"whatever").hexdigest()
+        dec._schema_cache[key] = [_FieldDef("cached", _FB_INT, 4)]
         defs = dec._get_field_defs(b"whatever", 42)
         assert len(defs) == 1
         assert defs[0].name == "cached"
@@ -457,6 +462,6 @@ class TestParseBfbsSchema:
         dec = FlatBufferDecoder()
         bfbs = _build_bfbs_schema(field_name="x", base_type=_FB_INT, field_offset=4)
         msg = _build_fb_message([(_FB_INT, struct.pack("<i", 42))])
-        assert 77 not in dec._schema_cache
+        assert not dec._schema_cache
         dec.decode(bfbs, msg, schema_id=77)
-        assert 77 in dec._schema_cache
+        assert len(dec._schema_cache) == 1
